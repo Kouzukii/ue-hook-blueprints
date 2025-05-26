@@ -1,4 +1,4 @@
-﻿# `ui-hook-blueprints` hook functions in cooked blueprints
+﻿# `ue-hook-blueprints` hook functions in cooked blueprints
 
 Inspired by https://github.com/bananaturtlesandwich/spaghetti
 
@@ -14,6 +14,8 @@ Inspired by https://github.com/bananaturtlesandwich/spaghetti
 - Package your project using configuration "Shipping"
 - Run this tool on your asset and the original game asset
 - Use [repak](https://github.com/trumank/repak) or [retoc](https://github.com/trumank/retoc) to create a modded .pak or .utoc
+
+For a full example check [my expedition 33 coop mod](https://github.com/Kouzukii/expedition33-coop)
 
 ## Usage
 
