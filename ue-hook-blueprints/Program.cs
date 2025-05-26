@@ -51,6 +51,8 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
 
     var importsToRewrite = new List<FPackageIndex>();
 
+    var fnameIndexProp = typeof(FName).GetProperty("Index", BindingFlags.NonPublic | BindingFlags.Instance)!;
+
     // rewrite all imports & exports of functions to the original blueprint
     TraverseAll(functionsToAdd, (i, n, path) => {
         if (i != null && i.IsImport()) {
@@ -78,7 +80,7 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
             }
             i.Index = value;
         } else if (n != null && n.Asset != orig) {
-            n.Index = orig.AddNameReference(n.Value);
+            fnameIndexProp.SetValue(n, orig.AddNameReference(n.Value));
             n.Asset = orig;
         }
     }, new HashSet<object>([hook], ReferenceEqualityComparer.Instance));
@@ -117,7 +119,9 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
 
     // set this or crash
     typeof(UAsset).GetField("NamesReferencedFromExportDataCount", BindingFlags.NonPublic | BindingFlags.Instance)!.SetValue(orig, orig.GetNameMapIndexList().Count);
-    orig.Write(output != null ? output.FullName : hookPath.FullName);
+    var outputFullName = output != null ? output.FullName : hookPath.FullName;
+    orig.Write(outputFullName);
+    Console.WriteLine($"Hooked blueprint written to {outputFullName}");
 }, hookPath, origPath, output, version, mappings);
 
 return await rootCommand.InvokeAsync(args);
