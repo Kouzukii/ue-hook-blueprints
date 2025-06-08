@@ -1,8 +1,10 @@
 ﻿using System.Collections;
 using System.CommandLine;
 using System.Reflection;
+using DeepEqual.Syntax;
 using UAssetAPI;
 using UAssetAPI.ExportTypes;
+using UAssetAPI.FieldTypes;
 using UAssetAPI.UnrealTypes;
 using UAssetAPI.Unversioned;
 
@@ -31,7 +33,7 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
         throw new Exception("provided hook is not a blueprint");
     var unloadedProperties = hClass.LoadedProperties.Where(p => oClass.LoadedProperties.All(property => p.Name != property.Name)).ToList();
     if (unloadedProperties.Count > 0)
-        throw new Exception($"Hook uses unloaded properties: {unloadedProperties}");
+        throw new Exception($"Hook uses properties not present in original: {unloadedProperties}");
 
     var functionsToAdd = hook.Exports.Where(i => i is FunctionExport && !i.ObjectName.ToString().StartsWith("orig_") && !i.ObjectName.ToString().StartsWith("ExecuteUbergraph_") && !oClass.FuncMap.ContainsKey(i.ObjectName)).ToList();
     if (functionsToAdd.Count == 0) {
@@ -39,14 +41,17 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
         return;
     }
     var exportMap = functionsToAdd.Select((e, i) => (hook.Exports.IndexOf(e) + 1, i + orig.Exports.Count + 1)).ToDictionary();
+    var hookMap = new Dictionary<FunctionExport, FunctionExport>();
 
     // rename all hooked functions to orig_NAME
     foreach (var hookFn in hook.Exports.Where(i => i is FunctionExport && i.ObjectName.ToString().StartsWith("hook_"))) {
-        var baseFn = orig.Exports.FindIndex(e => e is FunctionExport && e.ObjectName.ToString() == hookFn.ObjectName.ToString()[5..]);
-        if (baseFn == -1)
+        var baseFnIndex = orig.Exports.FindIndex(e => e is FunctionExport && e.ObjectName.ToString() == hookFn.ObjectName.ToString()[5..]);
+        if (baseFnIndex == -1)
             throw new Exception($"Blueprint defines {hookFn.ObjectName} but no function to hook was found");
-        orig.Exports[baseFn].ObjectName = orig.AddFName(new FString($"orig_{orig.Exports[baseFn].ObjectName}"));
-        oClass.FuncMap[orig.Exports[baseFn].ObjectName] = FPackageIndex.FromExport(baseFn);
+        var baseFn = orig.Exports[baseFnIndex];
+        baseFn.ObjectName = orig.AddFName(new FString($"orig_{baseFn.ObjectName}"));
+        oClass.FuncMap[baseFn.ObjectName] = FPackageIndex.FromExport(baseFnIndex);
+        hookMap[(FunctionExport)hookFn] = (FunctionExport)baseFn;
     }
 
     var importsToRewrite = new List<FPackageIndex>();
@@ -54,8 +59,8 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
     var fnameIndexProp = typeof(FName).GetProperty("Index", BindingFlags.NonPublic | BindingFlags.Instance)!;
 
     // rewrite all imports & exports of functions to the original blueprint
-    TraverseAll(functionsToAdd, (i, n, path) => {
-        if (i != null && i.IsImport()) {
+    TraverseAll(functionsToAdd, (i, path) => {
+        if (i.IsImport()) {
             var import = i.ToImport(hook);
             var index = orig.SearchForImport(import.ClassPackage, import.ClassName, import.ObjectName);
             if (index == 0) {
@@ -70,7 +75,7 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
                 index = orig.AddImport(newImport).Index;
             }
             i.Index = index;
-        } else if (i != null && i.IsExport()) {
+        } else if (i.IsExport()) {
             if (!exportMap.TryGetValue(i.Index, out var value)) {
                 var export = i.ToExport(hook);
                 var exportIndex = orig.Exports.FindIndex(e => e.ObjectName == export.ObjectName);
@@ -79,10 +84,11 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
                 value = exportIndex + 1;
             }
             i.Index = value;
-        } else if (n != null && n.Asset != orig) {
-            fnameIndexProp.SetValue(n, orig.AddNameReference(n.Value));
-            n.Asset = orig;
         }
+    }, (n, path) => {
+        if (n.Asset == orig) return;
+        fnameIndexProp.SetValue(n, orig.AddNameReference(n.Value));
+        n.Asset = orig;
     }, new HashSet<object>([hook], ReferenceEqualityComparer.Instance));
 
     // import all missing imports recursively
@@ -90,7 +96,8 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
         var import = importsToRewrite[i].ToImport(hook);
         var index = orig.SearchForImport(import.ClassPackage, import.ClassName, import.ObjectName);
         if (index == 0) {
-            var newImport = new Import(orig.AddFName(import.ClassPackage.Value),
+            var newImport = new Import(
+                orig.AddFName(import.ClassPackage.Value),
                 orig.AddFName(import.ClassName.Value),
                 import.OuterIndex,
                 orig.AddFName(import.ObjectName.Value),
@@ -104,17 +111,42 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
     }
 
     // add the hooked functions to the blueprint
-    foreach (var export in functionsToAdd) {
-        var fString = export.ObjectName.Value;
-        if (fString.Value.StartsWith("hook_"))
-            fString = new FString(fString.Value[5..]);
-        export.ObjectName = orig.AddFName(fString);
-        orig.Exports.Add(export);
+    foreach (FunctionExport funcExport in functionsToAdd) {
+        var funcName = funcExport.ObjectName.Value;
+        var isHook = false;
+        if (funcName.Value.StartsWith("hook_")) {
+            funcName = new FString(funcName.Value[5..]);
+            isHook = true;
+
+            var baseFn = hookMap[funcExport];
+            var hookParam = funcExport.LoadedProperties.Where(p =>
+                    (p.PropertyFlags & (EPropertyFlags.CPF_Parm | EPropertyFlags.CPF_OutParm | EPropertyFlags.CPF_ReturnParm)) != 0)
+                .ToList();
+            var baseParam = baseFn.LoadedProperties.Where(p =>
+                    (p.PropertyFlags & (EPropertyFlags.CPF_Parm | EPropertyFlags.CPF_OutParm | EPropertyFlags.CPF_ReturnParm)) != 0)
+                .ToList();
+            if (hookParam.Count != baseParam.Count)
+                throw new Exception($"Hooked function {funcExport.ObjectName}'s parameters do not match overriden function");
+            for (var i = 0; i < hookParam.Count; i++) {
+                var property = hookParam[i];
+                var baseProp = baseParam[i];
+                // we still check for the correct struct type, but ignore element size
+                if (baseProp is FStructProperty bs && property is FStructProperty hs)
+                    hs.ElementSize = bs.ElementSize;
+                try {
+                    property.WithDeepEqual(baseProp).Assert();
+                } catch (Exception e) {
+                    throw new Exception($"Hooked function {funcExport.ObjectName}'s parameter {property.Name} does not match overriden function", e);
+                }
+            }
+        }
+        funcExport.ObjectName = orig.AddFName(funcName);
+        orig.Exports.Add(funcExport);
         var index = new FPackageIndex(orig.Exports.Count);
-        oClass.FuncMap[export.ObjectName] = index;
+        oClass.FuncMap[funcExport.ObjectName] = index;
         oClass.Children = [..oClass.Children, index];
         oClass.CreateBeforeSerializationDependencies.Add(index);
-        Console.WriteLine($"Hooked {fString}");
+        Console.WriteLine($"{(isHook ? "Hooked" : "Added function")} {funcName}");
     }
 
     // set this or crash
@@ -126,23 +158,23 @@ rootCommand.SetHandler((hookPath, origPath, output, version, mappings) => {
 
 return await rootCommand.InvokeAsync(args);
 
-void TraverseAll(object o, Action<FPackageIndex?, FName?, string> func, HashSet<object> visitedObjects, string path = "#") {
+void TraverseAll(object o, Action<FPackageIndex, string> packageFunc, Action<FName, string> nameFunc, HashSet<object> visitedObjects, string path = "#") {
     if (!o.GetType().IsValueType && !visitedObjects.Add(o)) return;
 
     if (o is FPackageIndex i) {
-        func(i, null, path);
+        packageFunc(i, path);
         return;
     }
 
     if (o is FName n) {
-        func(null, n, path);
+        nameFunc(n, path);
         return;
     }
 
     if (o is ClassExport e) {
         foreach (ref var inter in e.Interfaces.AsSpan()) {
             var index = new FPackageIndex(inter.Class);
-            func(index, null, path);
+            packageFunc(index, path);
             inter.Class = index.Index;
         }
     }
@@ -150,7 +182,7 @@ void TraverseAll(object o, Action<FPackageIndex?, FName?, string> func, HashSet<
     if (o is IEnumerable t) {
         var ind = 0;
         foreach (var item in t) {
-            TraverseAll(item, func, visitedObjects, $"{path}[{ind++}]");
+            TraverseAll(item, packageFunc, nameFunc, visitedObjects, $"{path}[{ind++}]");
         }
     }
 
@@ -159,7 +191,7 @@ void TraverseAll(object o, Action<FPackageIndex?, FName?, string> func, HashSet<
     foreach (var field in fields) {
         var value = field.GetValue(o);
         if (value is null) continue;
-        TraverseAll(value, func, visitedObjects, $"{path}.{field.Name}");
+        TraverseAll(value, packageFunc, nameFunc, visitedObjects, $"{path}.{field.Name}");
     }
 }
 
